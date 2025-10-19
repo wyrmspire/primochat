@@ -1,0 +1,5 @@
+{
+  "name": "Primordia Agent",
+  "description": "An AI-powered agent to interact with the Primordia cloud orchestration service. Use natural language to build, deploy, and manage services.",
+  "requestFramePermissions": []
+}
