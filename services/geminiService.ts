@@ -1,14 +1,10 @@
+import { GoogleGenAI, FunctionDeclaration, Type, Chat, Part } from "@google/genai";
 
-import { GoogleGenAI, FunctionDeclaration, Type, Chat } from "@google/genai";
+// FIX: Per project guidelines, the API key must be sourced from process.env.API_KEY.
+// This also resolves the TypeScript error about 'import.meta.env'.
+export const API_KEY = process.env.API_KEY;
 
-const API_KEY = process.env.API_KEY;
-if (!API_KEY) {
-    throw new Error("API_KEY environment variable not set");
-}
-
-const ai = new GoogleGenAI({ apiKey: API_KEY });
-
-const tools: FunctionDeclaration[] = [
+export const tools: FunctionDeclaration[] = [
     {
         name: 'listFiles',
         description: 'Lists all files in the GCS workspace.',
@@ -82,7 +78,6 @@ const tools: FunctionDeclaration[] = [
                     type: Type.STRING, 
                     description: "HTTP method.",
                     enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-                    default: 'GET'
                 },
                 body: { type: Type.OBJECT, description: "JSON body for POST/PUT/PATCH requests." },
                 headers: { type: Type.OBJECT, description: "Request headers." },
@@ -94,39 +89,37 @@ const tools: FunctionDeclaration[] = [
 
 const systemInstruction = `You are an expert agent for the Primordia cloud orchestration service. Your goal is to help users build, deploy, and manage services by using the provided tools.
 Follow the recommended asynchronous workflow:
-1. Write source files using 'writeFile'. You must write package.json, index.js, and handler.js for a Node.js service.
-2. Submit a deployment job using 'submitWorkspaceJob'.
-3. After submitting a job, inform the user you will poll for the status. The user interface will handle the polling automatically.
-4. Interact with the deployed service using 'proxyRequest'.
+1.  Write source files using 'writeFile'. You must write package.json, index.js, and handler.js for a Node.js service.
+2.  Submit a deployment job using 'submitWorkspaceJob'.
+3.  After submitting a job, inform the user you will poll for the status. The user interface will handle the polling automatically. Do not call 'getWorkspaceJobStatus' yourself; the UI takes care of it.
+4.  Interact with the deployed service using 'proxyRequest'.
 Always use a 'pls-' prefix for service names to be compatible with the local proxy, for example: 'pls-my-service'.
 When creating a Node.js service, remember these key files:
-- package.json: Must include '"type": "module"'.
-- index.js: Must create an HTTP server listening on port 8080.
-- handler.js: Contains the core request handling logic.
+-   package.json: Must include '"type": "module"'.
+-   index.js: Must create an HTTP server listening on port 8080.
+-   handler.js: Contains the core request handling logic.
 Be concise and clear in your responses. When you use a tool, briefly explain what you are doing.`;
 
-const chat: Chat = ai.chats.create({
-  model: 'gemini-2.5-flash',
-  config: {
-    systemInstruction,
-    tools: [{ functionDeclarations: tools }],
-  },
-});
-
-export const geminiService = {
-  sendMessage: (message: string) => chat.sendMessage({ message }),
-  sendMessageWithHistory: (
-    history: { role: 'user' | 'model' | 'tool', parts: any[] }[],
-    newMessage: string
-  ) => {
-     const chatWithHistory = ai.chats.create({
+// Initialize the AI client and chat session only if the API key is provided.
+// This prevents runtime errors and allows the UI to handle the missing key gracefully.
+let chat: Chat | null = null;
+if (API_KEY) {
+    const ai = new GoogleGenAI({ apiKey: API_KEY });
+    chat = ai.chats.create({
         model: 'gemini-2.5-flash',
-        history,
         config: {
             systemInstruction,
             tools: [{ functionDeclarations: tools }],
         },
-     });
-     return chatWithHistory.sendMessage({ message: newMessage });
-  }
+    });
+}
+
+export const geminiService = {
+  isConfigured: () => !!chat,
+  sendMessage: (message: string | Part[]) => {
+    if (!chat) {
+        throw new Error("Gemini service is not configured. API_KEY is missing.");
+    }
+    return chat.sendMessage({ message });
+  },
 };

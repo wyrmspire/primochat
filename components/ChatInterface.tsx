@@ -1,28 +1,47 @@
-
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { GenerateContentResponse, FunctionCall } from '@google/genai';
+import { GenerateContentResponse, FunctionCall, Part } from '@google/genai';
 import { geminiService } from '../services/geminiService';
 import { primordiaService } from '../services/primordiaService';
 import type { ChatMessage, JobDocument } from '../types';
 import { MessageBubble } from './MessageBubble';
 import { SendIcon } from './icons';
 import { Spinner } from './Spinner';
+import { useJob } from '../contexts/JobContext';
 
 export const ChatInterface: React.FC = () => {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const { setActiveJob } = useJob();
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     };
 
     useEffect(scrollToBottom, [messages]);
+    
+    useEffect(() => {
+        if (!geminiService.isConfigured()) {
+            setMessages([{
+                id: 'config-error',
+                role: 'model',
+                text: 'The Gemini service is not configured. Please check your API key.'
+            }]);
+        }
+    }, []);
 
-    // FIX: Moved functionCallHandler inside the component to access state setters like setMessages.
-    const functionCallHandler = useCallback(async (toolCalls: FunctionCall[]) => {
-        let toolResultParts = [];
+    useEffect(() => {
+        // Cleanup job context on unmount
+        return () => {
+            setActiveJob(null);
+        };
+    }, [setActiveJob]);
+
+    const functionCallHandler = useCallback(async (toolCalls: FunctionCall[]): Promise<{ toolResultParts: Part[], toolResultMessages: ChatMessage[] }> => {
+        let toolResultParts: Part[] = [];
+        let toolResultMessages: ChatMessage[] = [];
+
         for (const call of toolCalls) {
             let result: any;
             let isError = false;
@@ -55,140 +74,143 @@ export const ChatInterface: React.FC = () => {
                         result = { error: `Unknown tool: ${call.name}` };
                         isError = true;
                 }
-            } catch (e: any) {
+            } catch (e: unknown) {
                 console.error(`Error calling tool ${call.name}:`, e);
-                result = { error: e.message || 'An unknown error occurred' };
+                // FIX: Properly handle unknown error types in catch block.
+                const message = e instanceof Error ? e.message : String(e);
+                result = { error: message || 'An unknown error occurred' };
                 isError = true;
             }
     
+            // FIX: The Part type for a tool response uses `functionResponse`.
             toolResultParts.push({
-                toolResponse: {
+                functionResponse: {
                     name: call.name,
                     response: result,
                 }
             });
     
-            // Add visual feedback for the tool call result
-            setMessages(prev => [
-                ...prev,
-                {
-                    id: `tool-result-${call.id}-${Date.now()}`,
-                    role: 'tool',
-                    text: `Result for ${call.name}`,
-                    toolResult: { id: call.id, response: result, isError },
-                }
-            ]);
+            toolResultMessages.push({
+                id: `tool-result-${call.id}-${Date.now()}`,
+                role: 'tool',
+                text: `Result for ${call.name}`,
+                toolResult: { id: call.id, response: result, isError },
+            });
         }
-        return toolResultParts;
-    }, []);
-
-    const pollJobStatus = useCallback(async (jobId: string, initialMessageId: string) => {
-        let isDone = false;
-        let finalStatus: JobDocument | null = null;
-        
-        // buildHistory is defined below, but it's a stable function definition
-        // processGeminiResponse is also defined below, this can cause stale closures but is outside the scope of the current fix.
-        // For now we will rely on function hoisting for processGeminiResponse.
-
-        while (!isDone) {
-            try {
-                const statusDoc = await primordiaService.getWorkspaceJobStatus(jobId);
-                setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Polling job ${jobId}... Status: ${statusDoc.status}` } : msg));
-
-                if (statusDoc.status === 'SUCCESS' || statusDoc.status === 'FAILED') {
-                    isDone = true;
-                    finalStatus = statusDoc;
-                } else {
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                }
-            } catch (error) {
-                console.error('Polling failed:', error);
-                setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Error polling job ${jobId}. See console for details.` } : msg));
-                isDone = true;
-            }
-        }
-        
-        if (finalStatus) {
-            setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Job ${jobId} finished with status: ${finalStatus?.status}` } : msg));
-            
-            // Send final status back to Gemini
-            const toolResultPart = { toolResponse: { name: 'getWorkspaceJobStatus', response: finalStatus } };
-            const history = buildHistory();
-            const response = await geminiService.sendMessageWithHistory(history, JSON.stringify(toolResultPart));
-            processGeminiResponse(response);
-        }
+        return { toolResultParts, toolResultMessages };
     }, []);
 
     const processGeminiResponse = useCallback(async (response: GenerateContentResponse) => {
+        const pollJobStatus = async (jobId: string, initialMessageId: string, originalToolResults: Part[]) => {
+            let isDone = false;
+            let finalStatus: JobDocument | null = null;
+            
+            while (!isDone) {
+                try {
+                    const statusDoc = await primordiaService.getWorkspaceJobStatus(jobId);
+                    setActiveJob(statusDoc);
+                    setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Polling job ${jobId}... Status: ${statusDoc.status}` } : msg));
+    
+                    if (statusDoc.status === 'SUCCESS' || statusDoc.status === 'FAILED') {
+                        isDone = true;
+                        finalStatus = statusDoc;
+                    } else {
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    }
+                } catch (error) {
+                    console.error('Polling failed:', error);
+                    setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Error polling job ${jobId}. See console for details.` } : msg));
+                    isDone = true;
+                }
+            }
+            
+            if (finalStatus) {
+                setMessages(prev => prev.map(msg => msg.id === initialMessageId ? { ...msg, text: `Job ${jobId} finished with status: ${finalStatus?.status}` } : msg));
+                
+                // FIX: The Part type for a tool response uses `functionResponse`.
+                // Filter out the original, provisional 'submitWorkspaceJob' result
+                const otherToolResults = originalToolResults.filter(p => p.functionResponse?.name !== 'submitWorkspaceJob');
+                // Create the new, final result for the job submission
+                // FIX: Spread finalStatus into a new object to make it assignable to the `response` property.
+                const jobStatusResultPart: Part = { functionResponse: { name: 'submitWorkspaceJob', response: { ...finalStatus } } };
+                
+                const allResults = [...otherToolResults, jobStatusResultPart];
+
+                const finalResponse = await geminiService.sendMessage(allResults);
+                await processGeminiResponse(finalResponse);
+            } else {
+                setActiveJob(null);
+                setIsLoading(false);
+            }
+        };
+
         const toolCalls = response.functionCalls;
-        
         const modelResponseText = response.text || '';
+        
+        const newMessages: ChatMessage[] = [];
         if (modelResponseText) {
-            setMessages(prev => [...prev, { id: `model-${Date.now()}`, role: 'model', text: modelResponseText }]);
+            newMessages.push({ id: `model-${Date.now()}`, role: 'model', text: modelResponseText });
         }
 
         if (toolCalls && toolCalls.length > 0) {
-            setMessages(prev => [...prev, { id: `model-tool-${Date.now()}`, role: 'model', text: "Using tools...", toolCalls }]);
-            
-            const toolResultParts = await functionCallHandler(toolCalls);
+            newMessages.push({ id: `model-tool-${Date.now()}`, role: 'model', text: "Using tools...", toolCalls });
+            if (newMessages.length > 0) {
+              setMessages(prev => [...prev, ...newMessages]);
+            }
 
-            // Special handling for job submission to start polling
+            const { toolResultParts, toolResultMessages } = await functionCallHandler(toolCalls);
+            setMessages(prev => [...prev, ...toolResultMessages]);
+
             const jobSubmissionCall = toolCalls.find(tc => tc.name === 'submitWorkspaceJob');
-            const jobSubmissionResult = toolResultParts.find(p => p.toolResponse.name === 'submitWorkspaceJob');
+            // FIX: The Part type for a tool response uses `functionResponse`.
+            const jobSubmissionResult = toolResultParts.find(p => p.functionResponse?.name === 'submitWorkspaceJob');
 
-            if (jobSubmissionCall && jobSubmissionResult?.toolResponse.response?.jobId) {
-                const jobId = jobSubmissionResult.toolResponse.response.jobId;
+            // FIX: The Part type for a tool response uses `functionResponse`.
+            if (jobSubmissionCall && jobSubmissionResult?.functionResponse?.response?.jobId) {
+                // FIX: The Part type for a tool response uses `functionResponse`.
+                const jobId = jobSubmissionResult.functionResponse.response.jobId;
                 const pollMessageId = `polling-${jobId}-${Date.now()}`;
                 setMessages(prev => [...prev, { id: pollMessageId, role: 'model', text: `Polling job ${jobId}...` }]);
-                pollJobStatus(jobId, pollMessageId);
+                await pollJobStatus(jobId, pollMessageId, toolResultParts);
             } else {
-                 const history = buildHistory();
-                 const finalResponse = await geminiService.sendMessageWithHistory(history, JSON.stringify({toolCallResponse: {parts: toolResultParts}}));
-                 processGeminiResponse(finalResponse);
+                 const finalResponse = await geminiService.sendMessage(toolResultParts);
+                 await processGeminiResponse(finalResponse);
             }
         } else {
+             if (newMessages.length > 0) {
+              setMessages(prev => [...prev, ...newMessages]);
+            }
             setIsLoading(false);
         }
-    }, [pollJobStatus, functionCallHandler]);
+    }, [functionCallHandler, setActiveJob]);
 
-    const buildHistory = () => {
-        return messages.map(msg => {
-            const parts: any[] = [{ text: msg.text }];
-            if (msg.toolCalls) {
-                parts.push({ functionCall: msg.toolCalls[0] });
-            }
-            if (msg.toolResult) {
-                parts.push({ toolResponse: { name: 'function-response', response: msg.toolResult.response } });
-            }
-            return {
-                role: msg.role === 'tool' ? 'model' : msg.role, // Gemini expects 'model' for tool results
-                parts: parts.filter(p => p.text !== undefined || p.functionCall || p.toolResponse)
-            };
-        }).filter(h => h.parts.length > 0);
-    };
 
-    const handleSubmit = async (e: React.FormEvent) => {
+    // FIX: Changed event type from React.FormEvent to React.SyntheticEvent to handle
+    // both form onSubmit and textarea onKeyDown events with the same handler.
+    const handleSubmit = async (e: React.SyntheticEvent) => {
         e.preventDefault();
-        if (!input.trim() || isLoading) return;
+        if (!input.trim() || isLoading || !geminiService.isConfigured()) return;
 
         const userMessage: ChatMessage = { id: `user-${Date.now()}`, role: 'user', text: input };
         setMessages(prev => [...prev, userMessage]);
+        const currentInput = input;
         setInput('');
         setIsLoading(true);
 
         try {
-            const history = buildHistory();
-            const response = await geminiService.sendMessageWithHistory(history, input);
+            const response = await geminiService.sendMessage(currentInput);
             await processGeminiResponse(response);
         } catch (error) {
             console.error("Failed to send message:", error);
-            setMessages(prev => [...prev, { id: `error-${Date.now()}`, role: 'model', text: "Sorry, something went wrong." }]);
+            // FIX: The `error` variable is of type `unknown` and must be converted to a string before use.
+            const message = error instanceof Error ? error.message : String(error);
+            setMessages(prev => [...prev, { id: `error-${Date.now()}`, role: 'model', text: `Sorry, something went wrong: ${message}` }]);
             setIsLoading(false);
         }
     };
 
     return (
-        <div className="flex flex-col h-[calc(100vh-100px)] w-full max-w-4xl mx-auto bg-gray-800 rounded-lg shadow-2xl">
+        <div className="flex flex-col h-full w-full bg-gray-800">
             <div className="flex-grow p-4 overflow-y-auto space-y-4">
                 {messages.map((msg) => (
                     <MessageBubble key={msg.id} message={msg} />
@@ -201,7 +223,7 @@ export const ChatInterface: React.FC = () => {
                 )}
                 <div ref={messagesEndRef} />
             </div>
-            <div className="p-4 border-t border-gray-700">
+            <div className="p-4 border-t border-gray-700 bg-gray-800">
                 <form onSubmit={handleSubmit} className="flex items-center gap-3">
                     <textarea
                         value={input}
@@ -212,14 +234,14 @@ export const ChatInterface: React.FC = () => {
                                 handleSubmit(e);
                             }
                         }}
-                        placeholder="e.g., Deploy a node service called pls-hello-world that returns { message: 'hello' }"
+                        placeholder="e.g., Deploy a node service called pls-hello-world..."
                         className="flex-grow bg-gray-700 text-gray-200 p-3 rounded-lg focus:ring-2 focus:ring-cyan-500 focus:outline-none resize-none"
                         rows={1}
-                        disabled={isLoading}
+                        disabled={isLoading || !geminiService.isConfigured()}
                     />
                     <button
                         type="submit"
-                        disabled={isLoading || !input.trim()}
+                        disabled={isLoading || !input.trim() || !geminiService.isConfigured()}
                         className="bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white p-3 rounded-full transition-colors duration-200"
                     >
                         <SendIcon className="w-6 h-6" />
